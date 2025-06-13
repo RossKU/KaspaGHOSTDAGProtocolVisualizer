@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kaspa GHOSTDAG Protocol Visualizer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { height: 100%; overflow: hidden; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background-color: #f6f8fa; color: #24292f;
+        }
+        .container { width: 100%; display: flex; flex-direction: column; position: relative; }
+        .header {
+            text-align: center; padding: 20px 0; background: white;
+            border-bottom: 1px solid #d1d9e0;
+        }
+        .header h1 { font-size: 24px; font-weight: 600; margin-bottom: 5px; }
+        .header .subtitle { color: #57606a; font-size: 14px; }
+        .visualization { flex: 1; position: relative; overflow: hidden; background: white; }
+        .zone-labels {
+            position: absolute; top: 20px; left: 0; right: 0;
+            display: flex; justify-content: space-between;
+            padding: 0 50px; z-index: 10;
+        }
+        .zone-label { color: #57606a; font-size: 12px; font-weight: 500; }
+        .canvas-container { position: absolute; top: 60px; left: 0; right: 0; bottom: 100px; }
+        .block {
+            position: absolute; border-radius: 6px;
+            display: flex; align-items: center; justify-content: center;
+            color: white; font-weight: 600; cursor: pointer;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1); z-index: 5;
+            transition: transform 0.3s, width 0.3s, height 0.3s, font-size 0.3s;
+        }
+        .block.blue { background: #0969da; }
+        .block.red { background: #cf222e; }
+        .block.virtual-chain {
+            box-shadow: 0 0 20px rgba(9, 105, 218, 0.5); z-index: 6;
+            background-color: #0550ae;
+        }
+        .block:hover { transform: scale(1.05); z-index: 10; }
+        #dagCanvas, #virtualCanvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+        #dagCanvas { z-index: 1; }
+        #virtualCanvas { z-index: 2; }
+        .daa-score {
+            position: absolute; color: #8b949e; text-align: center;
+            z-index: 3; transform: translateX(-50%);
+            transition: opacity 0.3s, font-size 0.3s;
+        }
+        .stats-panel {
+            position: absolute; bottom: 20px; left: 20px; background: white;
+            border: 1px solid #d1d9e0; border-radius: 6px; padding: 15px;
+            min-width: 200px; z-index: 10;
+        }
+        .stats-title { color: #57606a; font-size: 11px; font-weight: 500; margin-bottom: 10px; }
+        .stat-item { color: #8b949e; font-size: 10px; margin-bottom: 5px; }
+        .stat-value { color: #0969da; font-weight: 600; }
+        .controls { position: absolute; bottom: 20px; right: 20px; z-index: 10; }
+        button {
+            background: #0969da; color: white; border: none; padding: 8px 16px;
+            border-radius: 6px; font-size: 14px; cursor: pointer; margin: 0 5px;
+            transition: background 0.2s; min-width: 40px;
+        }
+        button:hover { background: #0860ca; }
+        button:disabled { background: #8b949e; cursor: not-allowed; }
+        .fade-in { animation: fadeIn 0.5s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: scale(0.8); } to { opacity: 1; transform: scale(1); } }
+    </style>
+</head>
+<body>
+    <div class="container" id="mainContainer">
+        <div class="header">
+            <h1>Kaspa GHOSTDAG Protocol Visualizer</h1>
+            <p class="subtitle">10 BPS</p>
+        </div>
+        
+        <div class="visualization">
+            <div class="zone-labels">
+                <span class="zone-label">LINEAR CHAIN</span>
+                <span class="zone-label">GHOSTDAG ORDERING</span>
+                <span class="zone-label">PARALLEL BLOCKS</span>
+            </div>
+            
+            <div class="canvas-container" id="canvasContainer">
+                <canvas id="dagCanvas"></canvas>
+                <canvas id="virtualCanvas"></canvas>
+            </div>
+            
+            <div class="stats-panel">
+                <div class="stats-title">NETWORK STATS</div>
+                <div class="stat-item">Block Rate: <span class="stat-value" id="bps">--</span></div>
+                <div class="stat-item">Blue Score: <span class="stat-value" id="blueScore">--</span></div>
+                <div class="stat-item">DAA Score: <span class="stat-value" id="daaScore">--</span></div>
+                <div class="stat-item">Block Count: <span class="stat-value" id="blockCount">--</span></div>
+            </div>
+            
+            <div class="controls">
+                <button onclick="toggleAnimation()" id="toggleBtn">Pause</button>
+                <button onclick="resetVisualization()">Reset</button>
+                <button onclick="zoomOut()" id="zoomOutBtn">-</button>
+                <button onclick="zoomIn()" id="zoomInBtn">+</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Global state
+        let blocks = [], daaScores = [], linearChainBlocks = [];
+        let animationRunning = true;
+        let canvas, ctx, virtualCanvas, vCtx;
+        let containerWidth, containerHeight, centerY;
+        
+        // --- API駆動のための新しい状態管理 ---
+        let processedBlockHashes = new Set();
+        let blockMap = new Map();
+        let isPolling = false;
+        
+        // Zoom state
+        let zoomLevel = 1.0;
+        const ZOOM_STEP = 0.2, MIN_ZOOM = 0.4, MAX_ZOOM = 1.6;
+
+        // Base values
+        const BASE_BLOCK_SIZE = 50, BASE_VIRTUAL_BLOCK_SIZE = 70;
+        const BASE_FONT_SIZE = 14, BASE_SLIDE_SPEED = 2.5;
+        const BASE_MIN_DISTANCE_X = 120, BASE_LINE_WIDTH = 1.5;
+        const MIN_PARENT_DISTANCE = 20;
+
+        let zones = { parallel: { start: 0.7, end: 1.0 }, transform: { start: 0.4, end: 0.7 }, linear: { start: 0, end: 0.4 } };
+        
+        function setContainerHeight() { document.getElementById('mainContainer').style.height = `${window.innerHeight}px`; }
+
+        function init() {
+            setContainerHeight();
+            canvas = document.getElementById('dagCanvas'); ctx = canvas.getContext('2d');
+            virtualCanvas = document.getElementById('virtualCanvas'); vCtx = virtualCanvas.getContext('2d');
+            resizeCanvas();
+            startApiPolling();
+            updateZoomButtons();
+            animate();
+        }
+        
+        function resizeCanvas() {
+            const container = document.getElementById('canvasContainer');
+            containerWidth = container.clientWidth; containerHeight = container.clientHeight;
+            centerY = containerHeight / 2;
+            canvas.width = containerWidth; canvas.height = containerHeight;
+            virtualCanvas.width = containerWidth; virtualCanvas.height = containerHeight;
+        }
+        
+        class Block {
+            constructor(data) {
+                this.id = data.hash.slice(-6);
+                this.hash = data.hash;
+                this.x = containerWidth - 50;
+                this.y = centerY - (BASE_BLOCK_SIZE * zoomLevel) / 2 + (Math.random() - 0.5) * 400;
+                this.parents = data.parentHashes.map(hash => blockMap.get(hash)).filter(p => p);
+                this.isBlue = data.isChainBlock;
+                this.isVirtualChain = false;
+                this.daaScoreVal = parseInt(data.daaScore);
+                this.element = null; this.zone = this.getZone(); this.inLinearChain = false;
+                this.chainWork = parseInt(data.blueWork); // APIから直接取得
+                this.isVirtualChainLocked = false;
+                this.x_velocity_adjustment = 0;
+            }
+            
+            getZone() {
+                const relativeX = this.x / containerWidth;
+                if (relativeX > zones.parallel.start) return 'parallel';
+                if (relativeX > zones.transform.start) return 'transform';
+                return 'linear';
+            }
+            
+            createElement() {
+                const div = document.createElement('div');
+                div.className = `block ${this.isBlue ? 'blue' : 'red'} fade-in`;
+                div.textContent = this.id; div.id = `block-${this.hash}`;
+                this.element = div; this.updateStyle();
+                document.getElementById('canvasContainer').appendChild(div);
+            }
+            
+            updateStyle() {
+                if (!this.element) return;
+                if (this.isVirtualChain) this.element.classList.add('virtual-chain');
+                else this.element.classList.remove('virtual-chain');
+                const size = (this.isVirtualChain ? BASE_VIRTUAL_BLOCK_SIZE : BASE_BLOCK_SIZE) * zoomLevel;
+                this.element.style.width = `${size}px`; this.element.style.height = `${size}px`;
+                this.element.style.fontSize = `${zoomLevel < 0.7 ? 0 : BASE_FONT_SIZE * zoomLevel}px`;
+                this.element.style.left = `${this.x}px`; this.element.style.top = `${this.y}px`;
+            }
+
+            updatePosition() {
+                this.x -= (BASE_SLIDE_SPEED * zoomLevel) + this.x_velocity_adjustment;
+                const prevZone = this.zone;
+                if (!this.isBlue && this.parents.length > 0) {
+                    const validParents = this.parents.filter(p => p);
+                    if (validParents.length > 0) {
+                        let avgParentX = 0;
+                        validParents.forEach(p => avgParentX += p.x);
+                        avgParentX /= validParents.length;
+                        if (this.x > avgParentX) this.x += (avgParentX - this.x) * 0.025;
+                    }
+                }
+                this.zone = this.getZone();
+                if (prevZone === 'parallel' && this.zone === 'transform') this.isVirtualChainLocked = true;
+                const size = (this.isVirtualChain ? BASE_VIRTUAL_BLOCK_SIZE : BASE_BLOCK_SIZE) * zoomLevel;
+                if (prevZone !== this.zone) {
+                    if (this.zone === 'transform') {
+                        if (this.isBlue) this.targetY = centerY - size / 2; else this.targetY = centerY + 150;
+                    }
+                    if (this.zone === 'linear' && this.isBlue && !this.inLinearChain) this.addToLinearChain();
+                }
+                if (Math.abs(this.y - this.targetY) > 1) this.y += (this.targetY - this.y) * 0.025;
+                if (this.zone === 'linear' && this.isBlue) this.targetY = centerY - size / 2;
+                if (this.element) this.updateStyle();
+            }
+            
+            addToLinearChain() {
+                this.inLinearChain = true;
+                const size = (this.isVirtualChain ? BASE_VIRTUAL_BLOCK_SIZE : BASE_BLOCK_SIZE) * zoomLevel;
+                this.targetY = centerY - size / 2;
+                let insertIndex = linearChainBlocks.length;
+                for (let i = linearChainBlocks.length - 1; i >= 0; i--) {
+                    const chainBlock = linearChainBlocks[i];
+                    if (this.parents.includes(chainBlock)) { insertIndex = i + 1; break; }
+                    if (chainBlock.parents.includes(this)) insertIndex = Math.min(insertIndex, i);
+                }
+                linearChainBlocks.splice(insertIndex, 0, this);
+                daaScores.push(new DAAScoreLabel(this.daaScoreVal, this));
+            }
+            
+            getCenterX() { return this.x + ((this.isVirtualChain ? BASE_VIRTUAL_BLOCK_SIZE : BASE_BLOCK_SIZE) * zoomLevel) / 2; }
+            getCenterY() { return this.y + ((this.isVirtualChain ? BASE_VIRTUAL_BLOCK_SIZE : BASE_BLOCK_SIZE) * zoomLevel) / 2; }
+            
+            remove() {
+                if (this.element) this.element.remove();
+                if (blockMap.has(this.hash)) blockMap.delete(this.hash);
+                if (processedBlockHashes.has(this.hash)) processedBlockHashes.delete(this.hash);
+                if (linearChainBlocks.includes(this)) linearChainBlocks.splice(linearChainBlocks.indexOf(this), 1);
+            }
+        }
+        
+        class DAAScoreLabel {
+            constructor(score, targetBlock) {
+                this.score = score; this.targetBlock = targetBlock; this.element = null;
+                const interval = Math.max(1, Math.round(2 / zoomLevel));
+                this.isVisible = (daaScores.length % interval === 0);
+                this.createElement();
+            }
+            createElement() {
+                const div = document.createElement('div');
+                div.className = 'daa-score';
+                div.textContent = this.score.toLocaleString();
+                if (!this.isVisible) div.style.display = 'none';
+                this.element = div; this.updateStyle();
+                document.getElementById('canvasContainer').appendChild(div);
+            }
+            updateStyle() {
+                if (!this.element) return;
+                this.element.style.fontSize = `${10 * zoomLevel}px`;
+                this.updatePosition();
+            }
+            updatePosition() {
+                if (this.targetBlock && this.element) {
+                    this.element.style.left = `${this.targetBlock.getCenterX()}px`;
+                    this.element.style.top = `${containerHeight - 80}px`;
+                }
+            }
+            remove() { if (this.element) this.element.remove(); }
+        }
+
+        async function fetchBlockWithParents(hash) {
+            if (processedBlockHashes.has(hash)) return;
+            processedBlockHashes.add(hash);
+
+            const response = await fetch(`/api/kaspa?endpoint=blocks&id=${hash}`);
+            if (!response.ok) { console.error(`Failed to fetch block ${hash}`); return; }
+            const data = await response.json();
+
+            if (data.parentHashes) {
+                await Promise.all(data.parentHashes.map(parentHash => fetchBlockWithParents(parentHash)));
+            }
+
+            if (!blockMap.has(data.hash)) {
+                const newBlock = new Block(data);
+                blocks.push(newBlock);
+                blockMap.set(data.hash, newBlock);
+                newBlock.createElement();
+
+                const minParentDist = MIN_PARENT_DISTANCE * zoomLevel;
+                newBlock.parents.forEach(parent => {
+                    if (parent && newBlock.x - parent.x < minParentDist) {
+                        parent.x = newBlock.x - minParentDist;
+                    }
+                });
+            }
+        }
+
+        async function startApiPolling() {
+            if (isPolling || !animationRunning) {
+                if(!animationRunning) setTimeout(startApiPolling, 3000);
+                return;
+            };
+            isPolling = true;
+
+            try {
+                const response = await fetch('/api/kaspa?endpoint=info/blockdag');
+                if (!response.ok) throw new Error('Network response was not ok');
+                const data = await response.json();
+                
+                updateStats(data);
+
+                const newTipHashes = data.tipHashes.filter(hash => !processedBlockHashes.has(hash));
+                if (newTipHashes.length > 0) {
+                    await Promise.all(newTipHashes.map(hash => fetchBlockWithParents(hash)));
+                    calculateVirtualChain();
+                }
+            } catch (error) {
+                console.error("Failed to poll API:", error);
+            } finally {
+                isPolling = false;
+                setTimeout(startApiPolling, 3000);
+            }
+        }
+
+        function calculateVirtualChain() {
+            const blueBlocks = blocks.filter(b => b.isBlue);
+            if (blueBlocks.length === 0) return;
+
+            const virtualChainTip = blueBlocks
+                .filter(b => b.zone === 'parallel')
+                .reduce((max, block) => (parseInt(block.chainWork) > parseInt(max.chainWork)) ? block : max, {chainWork: -1});
+
+            if (virtualChainTip.chainWork === -1) return;
+
+            blocks.forEach(b => { if (!b.isVirtualChainLocked) b.isVirtualChain = false; });
+            
+            let current = virtualChainTip;
+            while(current) {
+                if (!current.isVirtualChainLocked) current.isVirtualChain = true;
+                
+                let nextParent = null, maxParentWork = -1;
+                current.parents.forEach(p => {
+                    if (p && p.isBlue && parseInt(p.chainWork) > maxParentWork) {
+                        maxParentWork = parseInt(p.chainWork);
+                        nextParent = p;
+                    }
+                });
+                current = nextParent;
+            }
+        }
+        
+        function determineSiblingOrder() {
+            const siblings = blocks.filter(b => b.isBlue && !b.isVirtualChain && b.zone === 'parallel');
+            if (siblings.length < 2) return;
+
+            siblings.forEach(s => s.x_velocity_adjustment = 0);
+
+            const findVirtualChainAncestor = (block) => {
+                let current = block, visited = new Set();
+                while(current && !visited.has(current.hash)) {
+                    visited.add(current.hash);
+                    const vcParent = current.parents.find(p => p && p.isVirtualChain);
+                    if (vcParent) return vcParent;
+                    current = current.parents.reduce((best, p) => (p && parseInt(p.chainWork) > (best ? parseInt(best.chainWork) : -1)) ? p : best, null);
+                }
+                return null;
+            };
+
+            for (let i = 0; i < siblings.length; i++) {
+                for (let j = i + 1; j < siblings.length; j++) {
+                    const blockA = siblings[i], blockB = siblings[j];
+                    const ancestorA = findVirtualChainAncestor(blockA), ancestorB = findVirtualChainAncestor(blockB);
+                    let shouldAbeFirst = blockA.hash < blockB.hash;
+                    if (ancestorA && ancestorB && ancestorA.hash !== ancestorB.hash) {
+                        shouldAbeFirst = parseInt(ancestorA.chainWork) < parseInt(ancestorB.chainWork);
+                    }
+                    const isAFirstSpatially = blockA.x < blockB.x;
+                    const adjustment = 0.2 * zoomLevel;
+                    if (shouldAbeFirst && !isAFirstSpatially) {
+                        blockA.x_velocity_adjustment += adjustment; blockB.x_velocity_adjustment -= adjustment;
+                    } else if (!shouldAbeFirst && isAFirstSpatially) {
+                        blockA.x_velocity_adjustment -= adjustment; blockB.x_velocity_adjustment += adjustment;
+                    }
+                }
+            }
+        }
+
+        function adjustBlockPositions() {
+            const minDistanceX = BASE_MIN_DISTANCE_X * zoomLevel, yInfluenceRange = 60 * zoomLevel;
+            for (let i = 0; i < blocks.length; i++) {
+                for (let j = i + 1; j < blocks.length; j++) {
+                    const blockA = blocks[i], blockB = blocks[j];
+                    const dx = blockA.x - blockB.x, dy = blockA.y - blockB.y;
+                    if (Math.abs(dy) < yInfluenceRange) {
+                        const distanceX = Math.abs(dx);
+                        if (distanceX > 0 && distanceX < minDistanceX) {
+                            const overlap = minDistanceX - distanceX, pushAmount = overlap * 0.2;
+                            if (blockA.x < blockB.x) blockA.x -= pushAmount; else blockB.x -= pushAmount;
+                        }
+                    }
+                }
+            }
+            const minParentDist = MIN_PARENT_DISTANCE * zoomLevel;
+            blocks.forEach(child => {
+                child.parents.forEach(parent => {
+                    if (parent && child.x - parent.x < minParentDist) parent.x = child.x - minParentDist;
+                });
+            });
+        }
+        
+        function animate() {
+            if (!animationRunning) { requestAnimationFrame(animate); return; }
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            vCtx.clearRect(0, 0, virtualCanvas.width, virtualCanvas.height);
+            
+            blocks.forEach(block => block.updatePosition());
+            adjustBlockPositions();
+            determineSiblingOrder();
+            
+            blocks.forEach(b => {
+                if(b.isVirtualChain && !b.isVirtualChainLocked && b.x < -50) {
+                    b.isVirtualChainLocked = true;
+                }
+            });
+
+            daaScores.forEach(score => score.updatePosition());
+            
+            const removalThreshold = -500;
+            const blocksOnScreen = blocks.filter(b => b.x > removalThreshold);
+            if (blocksOnScreen.length < blocks.length) {
+                const blocksToRemove = blocks.filter(b => b.x <= removalThreshold);
+                blocksToRemove.forEach(b => b.remove());
+                blocks = blocksOnScreen;
+            }
+
+            daaScores = daaScores.filter(s => (s.targetBlock && blocks.includes(s.targetBlock)) || (s.remove(), false));
+            
+            drawConnections();
+            drawVirtualChain();
+            
+            requestAnimationFrame(animate);
+        }
+        
+        function drawConnections() {
+            ctx.strokeStyle = '#8b949e'; ctx.lineWidth = BASE_LINE_WIDTH * zoomLevel; ctx.fillStyle = '#8b949e';
+            blocks.forEach(block => {
+                block.parents.forEach(parent => {
+                    if (parent && parent.element) {
+                        const x1 = block.getCenterX(), y1 = block.getCenterY(), x2 = parent.getCenterX(), y2 = parent.getCenterY();
+                        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+                        const angle = Math.atan2(y2 - y1, x2 - x1), len = 6 * zoomLevel;
+                        ctx.beginPath(); ctx.moveTo(x2, y2);
+                        ctx.lineTo(x2 - len * Math.cos(angle - Math.PI / 6), y2 - len * Math.sin(angle - Math.PI / 6));
+                        ctx.lineTo(x2 - len * Math.cos(angle + Math.PI / 6), y2 - len * Math.sin(angle + Math.PI / 6));
+                        ctx.closePath(); ctx.fill();
+                    }
+                });
+            });
+        }
+        
+        function drawVirtualChain() {
+            const virtualBlocks = blocks.filter(b => b.isVirtualChain);
+            if (virtualBlocks.length < 2) return;
+            vCtx.strokeStyle = '#0969da'; vCtx.lineWidth = 4 * zoomLevel; vCtx.globalAlpha = 0.8;
+            virtualBlocks.sort((a, b) => a.x - b.x);
+            vCtx.beginPath();
+            virtualBlocks.forEach((block, i) => {
+                const x = block.getCenterX(), y = block.getCenterY();
+                if (i === 0) vCtx.moveTo(x, y); else vCtx.lineTo(x, y);
+            });
+            vCtx.stroke(); vCtx.globalAlpha = 1;
+        }
+        
+        function updateStats(apiData) {
+            if (!apiData) return;
+            document.getElementById('blueScore').textContent = parseInt(apiData.blueScore).toLocaleString();
+            document.getElementById('daaScore').textContent = parseInt(apiData.virtualDaaScore).toLocaleString();
+            document.getElementById('blockCount').textContent = parseInt(apiData.blockCount).toLocaleString();
+            document.getElementById('bps').textContent = apiData.difficulty.toFixed(2);
+        }
+
+        function applyZoom() {
+            const normalizedZoom = (zoomLevel - MIN_ZOOM) / (MAX_ZOOM - MIN_ZOOM);
+            const linearEnd = 0.2 + 0.4 * (1 - normalizedZoom);
+            const transformEnd = linearEnd + 0.3;
+            zones.linear.end = linearEnd;
+            zones.transform.start = linearEnd; zones.transform.end = transformEnd;
+            zones.parallel.start = transformEnd;
+            blocks.forEach(b => b.updateStyle());
+            daaScores.forEach(s => s.updateStyle());
+            updateZoomButtons();
+        }
+
+        function zoomIn() { if (zoomLevel < MAX_ZOOM) { zoomLevel = Math.min(MAX_ZOOM, zoomLevel + ZOOM_STEP); applyZoom(); } }
+        function zoomOut() { if (zoomLevel > MIN_ZOOM) { zoomLevel = Math.max(MIN_ZOOM, zoomLevel - ZOOM_STEP); applyZoom(); } }
+        function updateZoomButtons() {
+            document.getElementById('zoomInBtn').disabled = zoomLevel >= MAX_ZOOM;
+            document.getElementById('zoomOutBtn').disabled = zoomLevel <= MIN_ZOOM;
+        }
+        function toggleAnimation() {
+            animationRunning = !animationRunning;
+            document.getElementById('toggleBtn').textContent = animationRunning ? 'Pause' : 'Resume';
+        }
+        function resetVisualization() {
+            blocks.forEach(b => b.remove()); daaScores.forEach(s => s.remove());
+            blocks = []; daaScores = []; linearChainBlocks = [];
+            processedBlockHashes.clear(); blockMap.clear();
+            if (zoomLevel !== 1.0) { zoomLevel = 1.0; applyZoom(); }
+        }
+        function handleResize() { setContainerHeight(); resizeCanvas(); }
+        window.addEventListener('load', init);
+        window.addEventListener('resize', handleResize);
+    </script>
+</body>
+</html>
